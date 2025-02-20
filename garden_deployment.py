@@ -1,5 +1,4 @@
 import modal
-import yaml
 from typing import TYPE_CHECKING, Any
 import subprocess
 
@@ -76,6 +75,7 @@ class C2PNetBase:
         self.load_model(self.model_path)
 
     def _load_config(self, config_path: str) -> dict[str, Any]:
+        import yaml
         with open(config_path, "r") as f:
             return yaml.safe_load(f)
 
