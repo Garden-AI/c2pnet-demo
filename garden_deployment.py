@@ -32,7 +32,7 @@ def download_models():
     _ = subprocess.run(["git", "lfs", "pull"], cwd="/root/C2PNets", check=True)
 
 image = (
-    modal.Image.debian_slim()
+    modal.Image.debian_slim(python_version="3.11")
     .apt_install(
         "git",
         "git-lfs",
@@ -44,7 +44,8 @@ image = (
         "torchvision",
         "numpy",
         "tensorrt>=8.6.1",
-        "torch-tensorrt>=1.4.0",  # Specify minimum version
+        "torch-tensorrt",  # Specify minimum version
+        "nvidia-modelopt>=0.4.0",
         "pyyaml",
     )
     .run_function(download_models)
@@ -63,6 +64,8 @@ class C2PNetBase:
         self.model_path = None  # Will be set by subclasses
         self.config = self._load_config(config_path)
         self.is_scaled = is_scaled
+        self.input_shape = None
+        self.s = None
 
         # Use hardcoded normalization constants from the C++ inference code
         self.input_mean = torch.tensor(
@@ -92,12 +95,37 @@ class C2PNetBase:
 
     def load_model(self, model_path: str) -> None:
         """Load model or TensorRT engine"""
-        if model_path.endswith(".engine"):
-            import tensorrt as trt
+        if self.model_path.endswith(".engine"):
+            import torch
+            import torch_tensorrt
+            import math
 
-            logger = trt.Logger(trt.Logger.WARNING)
-            with open(model_path, "rb") as f, trt.Runtime(logger) as runtime:
-                self.model = runtime.deserialize_cuda_engine(f.read())
+            # Load and compile model with TensorRT if not already done
+            if not hasattr(self, 'engine'):
+                base_model = torch.jit.load(self.model_path.replace('.engine', '.pth'))
+
+                input_dim = int(self.input_shape[1])
+                opt_shape = self.input_shape[0]
+
+                stream = torch.cuda.Stream()
+
+                # Compile with TensorRT
+                compiled_model = torch_tensorrt.compile(
+                    base_model,
+                    inputs=[torch_tensorrt.Input(
+                        min_shape=[int(math.floor((1 - self.s) * opt_shape)), input_dim],
+                        opt_shape=[int(opt_shape), input_dim],
+                        max_shape=[int(math.floor((1 + self.s) * opt_shape)), input_dim],
+                        dtype=torch.float32,
+                    )],
+                    enabled_precisions={torch.float32},
+                    workspace_size=1 << 30,
+                    ir="torchscript",
+                    truncate_long_and_double=True,
+                    require_full_compilation=True
+                )
+                self.model = compiled_model
+                self.stream = stream
         else:
             import torch
 
@@ -108,11 +136,9 @@ class C2PNetBase:
         """Convert input to normalized torch tensor"""
         import torch
 
-        # Convert to tensor if not already
         if not isinstance(input_data, torch.Tensor):
             x = torch.tensor(input_data, dtype=torch.float32, device=self.device)
         else:
-            # If already a tensor, ensure it's on the correct device
             x = input_data.to(self.device)
 
         # Normalize
@@ -131,48 +157,21 @@ class C2PNetBase:
         """Base prediction method"""
         import torch
 
-        if self.model_path.endswith(".engine"):
-            import torch_tensorrt
+        if not isinstance(input_data, torch.Tensor):
+            input_data = torch.tensor(input_data, dtype=torch.float32, device=self.device)
 
-            # Convert input to tensor if it's not already
-            if not isinstance(input_data, torch.Tensor):
-                input_data = torch.tensor(input_data, dtype=torch.float32, device=self.device)
+        with torch.no_grad():
+            if not self.is_scaled:
+                input_data = self.preprocess(input_data)
 
-            # Load and compile model with TensorRT if not already done
-            if not hasattr(self, 'engine'):
-                # Load the PyTorch model first
-                base_model = torch.jit.load(self.model_path.replace('.engine', '.pth'))
-
-                input_dim = input_data.shape[1]  # Assuming input_data is a 2D tensor
-                # Compile with TensorRT
-                compiled_model = torch_tensorrt.compile(
-                    base_model,
-                    inputs=[torch_tensorrt.Input(
-                        min_shape=[1, input_dim],
-                        opt_shape=[32, input_dim],
-                        max_shape=[128, input_dim],
-                    )],
-                    enabled_precisions={torch.float32},  # Run with FP32
-                    workspace_size=1 << 28  # 256MiB workspace size
-                )
-                self.engine = compiled_model
-
-            # Run inference
-            with torch.no_grad():
-                if not self.is_scaled:
-                    input_data = self.preprocess(input_data)
-                predictions = self.engine(input_data)
-            return self.postprocess(predictions)
-        else:
-            # Regular PyTorch inference path
-            if not isinstance(input_data, torch.Tensor):
-                input_data = torch.tensor(input_data, dtype=torch.float32, device=self.device)
-
-            with torch.no_grad():
-                if not self.is_scaled:
-                    input_data = self.preprocess(input_data)
+            if hasattr(self, 'stream'):
+                with torch.cuda.stream(self.stream):
+                    predictions = self.model(input_data)
+                    self.stream.synchronize()
+            else:
                 predictions = self.model(input_data)
-            return self.postprocess(predictions)
+
+        return self.postprocess(predictions)
 
 
 @app.cls(gpu="L4", image=image)
@@ -203,19 +202,19 @@ class NNC2PS(C2PNetBase):
         * Output values are automatically denormalized before being returned
         """
         import torch
-        # Convert to tensor if not already
         if not isinstance(input_data, torch.Tensor):
             input_data = torch.tensor(input_data, dtype=torch.float32, device=self.device)
         else:
-            # If already a tensor, ensure it's on the correct device
             input_data = input_data.to(dtype=torch.float32, device=self.device)
         return self._predict(input_data)
 
 @app.cls(gpu="L4", image=image)
 class NNC2PS_Engine(C2PNetBase):
-    def __init__(self) -> None:
+    def __init__(self, input_shape) -> None:
         super().__init__("/root/C2PNets/configs/nnc2ps_config.yaml")
         self.model_path = "/root/C2PNets/models/NNC2PS/NNC2PS.engine"
+        self.input_shape = input_shape
+        self.s = 0.05 # input_shape sensitivity
 
     @modal.method()
     def predict(self, input_data: "torch.Tensor") -> "torch.Tensor":
@@ -243,7 +242,6 @@ class NNC2PS_Engine(C2PNetBase):
         if not isinstance(input_data, torch.Tensor):
             input_data = torch.tensor(input_data, dtype=torch.float32, device=self.device)
         else:
-            # If already a tensor, ensure it's on the correct device
             input_data = input_data.to(dtype=torch.float32, device=self.device)
         return self._predict(input_data)
 
@@ -280,15 +278,16 @@ class NNC2PL(C2PNetBase):
         if not isinstance(input_data, torch.Tensor):
             input_data = torch.tensor(input_data, dtype=torch.float32, device=self.device)
         else:
-            # If already a tensor, ensure it's on the correct device
             input_data = input_data.to(dtype=torch.float32, device=self.device)
         return self._predict(input_data)
 
 @app.cls(gpu="L4", image=image)
 class NNC2PL_Engine(C2PNetBase):
-    def __init__(self) -> None:
+    def __init__(self, input_shape) -> None:
         super().__init__("/root/C2PNets/configs/nnc2ps_config.yaml")
         self.model_path = "/root/C2PNets/models/NNC2PL/NNC2PL.engine"
+        self.input_shape = input_shape
+        self.s = 0.05 # input_shape sensitivity
 
     @modal.method()
     def predict(self, input_data: "torch.Tensor") -> "torch.Tensor":
@@ -316,7 +315,6 @@ class NNC2PL_Engine(C2PNetBase):
         if not isinstance(input_data, torch.Tensor):
             input_data = torch.tensor(input_data, dtype=torch.float32, device=self.device)
         else:
-            # If already a tensor, ensure it's on the correct device
             input_data = input_data.to(dtype=torch.float32, device=self.device)
         return self._predict(input_data)
 
@@ -366,17 +364,18 @@ class NNC2PTabulated(C2PNetBase):
         if not isinstance(input_data, torch.Tensor):
             input_data = torch.tensor(input_data, dtype=torch.float32, device=self.device)
         else:
-            # If already a tensor, ensure it's on the correct device
             input_data = input_data.to(dtype=torch.float32, device=self.device)
         return self._predict(input_data)
 
 @app.cls(gpu="L4", image=image)
 class NNC2PTabulated_Engine(C2PNetBase):
-    def __init__(self) -> None:
+    def __init__(self, input_shape) -> None:
         import torch
 
         super().__init__("/root/C2PNets/configs/nnc2ps_config.yaml")
         self.model_path = "/root/C2PNets/models/NNC2P_Tabulated/NNC2P_Tabulated.engine"
+        self.input_shape = input_shape
+        self.s = 0.05 # input_shape sensitivity
 
          # Override normalization for tabulated model
         self.input_mean = torch.tensor(
@@ -417,7 +416,6 @@ class NNC2PTabulated_Engine(C2PNetBase):
         if not isinstance(input_data, torch.Tensor):
             input_data = torch.tensor(input_data, dtype=torch.float32, device=self.device)
         else:
-            # If already a tensor, ensure it's on the correct device
             input_data = input_data.to(dtype=torch.float32, device=self.device)
         return self._predict(input_data)
 
@@ -439,11 +437,11 @@ def main() -> None:
 
     # Initialize models
     c2ps = NNC2PS()
-    c2ps_engine = NNC2PS_Engine()
+    c2ps_engine = NNC2PS_Engine(input_shape=(n_samples, input_data.shape[1]))
     c2pl = NNC2PL()
-    c2pl_engine = NNC2PL_Engine()
+    c2pl_engine = NNC2PL_Engine(input_shape=(n_samples, input_data.shape[1]))
     c2pt = NNC2PTabulated()
-    c2pt_engine = NNC2PTabulated_Engine()
+    c2pt_engine = NNC2PTabulated_Engine(input_shape=(n_samples, input_data_tabulated.shape[1]))
 
     # Run predictions
     r1 = c2ps.predict.remote(input_data)
